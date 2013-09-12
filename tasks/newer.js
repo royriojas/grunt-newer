@@ -1,11 +1,53 @@
 var fs = require('fs');
 var path = require('path');
 
+var async = require('async');
 
-function getStamp(dir, name, target) {
+function getStampPath(dir, name, target) {
   return path.join(dir, name, target, 'timestamp');
 }
 
+function filterSrcByTime(srcFiles, time, callback) {
+  async.map(srcFiles, fs.stat, function(err, stats) {
+    if (err) {
+      return callback(err);
+    }
+    callback(null, srcFiles.filter(function(filename, index) {
+      return stats[index].mtime > time;
+    }));
+  });
+}
+
+function filterFilesByTime(files, previous, callback) {
+  var modified = false;
+  async.map(files, function(obj, done) {
+    var time;
+    /**
+     * It is possible that there is a dest file that has been created
+     * more recently than the last successful run.  This would happen if
+     * a target with multiple dest files failed before all dest files were
+     * created.  In this case, we don't need to re-run src files that map
+     * to dest files that were already created.
+     */
+    if (obj.dest && fs.existsSync(obj.dest)) {
+      time = Math.max(fs.statSync(obj.dest).mtime, previous);
+    } else {
+      time = previous;
+    }
+
+    filterSrcByTime(obj.src, time, function(err, src) {
+      if (err) {
+        return done(err);
+      }
+      if (src.length) {
+        modified = true;
+      }
+      done(null, {src: src, dest: obj.dest});
+    });
+  }, function(err, newerFiles) {
+    callback(err, newerFiles, modified);
+  });
+}
 
 function createTask(grunt, any) {
   return function(name, target) {
@@ -40,78 +82,69 @@ function createTask(grunt, any) {
       srcFiles = false;
     }
 
-    var files = grunt.task.normalizeMultiTaskFiles(config, target);
-
-    var newerFiles;
-    var stamp = getStamp(options.timestamps, name, target);
-    var repeat = grunt.file.exists(stamp);
-    var modified = false;
-
-    if (repeat) {
-      // look for files that have been modified since last run
-      var previous = fs.statSync(stamp).mtime;
-      newerFiles = files.map(function(obj) {
-        var time;
-        /**
-         * It is possible that there is a dest file that has been created
-         * more recently than the last successful run.  This would happen if
-         * a target with multiple dest files failed before all dest files were
-         * created.  In this case, we don't need to re-run src files that map
-         * to dest files that were already created.
-         */
-        if (obj.dest && grunt.file.exists(obj.dest)) {
-          time = Math.max(fs.statSync(obj.dest).mtime, previous);
-        } else {
-          time = previous;
-        }
-        var src = obj.src.filter(function(filepath) {
-          var newer = fs.statSync(filepath).mtime > time;
-          if (newer) {
-            modified = true;
-          }
-          return newer;
-        });
-        return {src: src, dest: obj.dest};
-      });
-    }
-
-    /**
-     * If we started out with only src files in the files config, transform
-     * the newerFiles array into an array of source files.
-     */
-    if (!srcFiles) {
-      newerFiles = newerFiles.map(function(obj) {
-        return obj.src;
-      });
-    }
-
-    /**
-     * Cases:
-     *
-     * 1) First run, process all.
-     * 2) Repeat run, nothing modified, process none.
-     * 3) Repeat run, something modified, any false, process modified.
-     * 4) Repeat run, something modified, any true, process all.
-     */
-
     var qualified = name + ':' + target;
-    if (repeat && !modified) {
-      // case 2
-      grunt.log.writeln('No newer files to process.');
-    } else {
-      if (repeat && modified && !any) {
-        // case 3
-        config.files = newerFiles;
-        delete config.src;
-        delete config.dest;
-        grunt.config.set([name, target], config);
-      }
-      // case 1, 3 or 4
+    var stamp = getStampPath(options.timestamps, name, target);
+    var repeat = grunt.file.exists(stamp);
+    if (!repeat) {
+      /**
+       * This task has never succeeded before.  Process everything.  This is
+       * less efficient than it could be for cases where some dest files were
+       * created in previous runs that failed, but it makes things easier.
+       */
       grunt.task.run([
         qualified + (args ? ':' + args : ''),
         'newer-timestamp:' + qualified + ':' + options.timestamps
       ]);
+      return;
     }
+
+    // This task has succeeded before.  Filter src files.
+
+    var done = this.async();
+
+    var previous = fs.statSync(stamp).mtime;
+    var files = grunt.task.normalizeMultiTaskFiles(config, target);
+    filterFilesByTime(files, previous, function(err, newerFiles, modified) {
+      if (err) {
+        return done(err);
+      }
+
+      /**
+       * Cases:
+       *
+       * 1) Nothing modified, process none.
+       * 2) Something modified, any false, process modified.
+       * 3) Something modified, any true, process all.
+       */
+      if (!modified) { // case 1
+        grunt.log.writeln('No newer files to process.');
+      } else {
+        if (!any) { // case 2
+          /**
+           * If we started out with only src files in the files config,
+           * transform the newerFiles array into an array of source files.
+           */
+          if (!srcFiles) {
+            newerFiles = newerFiles.map(function(obj) {
+              return obj.src;
+            });
+          }
+
+          config.files = newerFiles;
+          delete config.src;
+          delete config.dest;
+          grunt.config.set([name, target], config);
+        }
+        // case 2 or 3
+        grunt.task.run([
+          qualified + (args ? ':' + args : ''),
+          'newer-timestamp:' + qualified + ':' + options.timestamps
+        ]);
+      }
+
+      done();
+    });
+
   };
 }
 
@@ -131,7 +164,7 @@ module.exports = function(grunt) {
       'newer-timestamp', 'Internal task.', function(name, target, dir) {
         // if dir includes a ':', grunt will split it among multiple args
         dir = Array.prototype.slice.call(arguments, 2).join(':');
-        grunt.file.write(getStamp(dir, name, target), '');
+        grunt.file.write(getStampPath(dir, name, target), '');
       });
 
 };
