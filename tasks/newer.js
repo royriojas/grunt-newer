@@ -1,3 +1,4 @@
+var crypto = require('crypto');
 var fs = require('fs');
 var path = require('path');
 
@@ -5,6 +6,11 @@ var async = require('async');
 
 function getStampPath(dir, name, target) {
   return path.join(dir, name, target, 'timestamp');
+}
+
+function getHashPath(dir, name, target, filename) {
+  var hashedFilename = crypto.createHash('md5').update(filename).digest('hex');
+  return path.join(dir, name, target, 'hashes', hashedFilename);
 }
 
 function filterSrcByTime(srcFiles, time, callback) {
@@ -44,6 +50,65 @@ function filterFilesByTime(files, previous, callback) {
       }
       done(null, {src: src, dest: obj.dest});
     });
+  }, function(err, newerFiles) {
+    callback(err, newerFiles, modified);
+  });
+}
+
+function getExistingHash(filename, dir, name, target, callback) {
+  var hashPath = getHashPath(dir, name, target, filename);
+  fs.exists(hashPath, function(exists) {
+    if (!exists) {
+      return callback(null, null);
+    }
+    fs.readFile(hashPath, callback);
+  });
+}
+
+function generateFileHash(filename, callback) {
+  var md5sum = crypto.createHash('md5');
+  var stream = new fs.ReadStream(filename);
+  stream.on('data', function(chunk) {
+    md5sum.update(chunk);
+  });
+  stream.on('error', callback);
+  stream.on('end', function() {
+    callback(null, md5sum.digest('hex'));
+  });
+}
+
+function filterSrcByHash(srcFiles, dir, name, target, callback) {
+  async.filter(srcFiles, function(filename, done) {
+    async.parallel({
+      previous: function(cb) {
+        getExistingHash(filename, dir, name, target, cb);
+      },
+      current: function(cb) {
+        generateFileHash(filename, cb);
+      }
+    }, function(err, hashes) {
+      if (err) {
+        return callback(err);
+      }
+      done(String(hashes.previous) !== String(hashes.current));
+    });
+  }, callback);
+}
+
+function filterFilesByHash(files, name, target, callback) {
+  var modified = false;
+  async.map(files, function(obj, done) {
+
+    filterSrcByHash(obj.src, name, target, function(err, src) {
+      if (err) {
+        return done(err);
+      }
+      if (src.length) {
+        modified = true;
+      }
+      done(null, {src: src, dest: obj.dest});
+    });
+
   }, function(err, newerFiles) {
     callback(err, newerFiles, modified);
   });
